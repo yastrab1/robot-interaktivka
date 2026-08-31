@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="sk">
+<head>
+    <meta charset="UTF-8">
+    <title>Interaktívka — odovzdanie</title>
+    <style>
+        body { font-family: sans-serif; max-width: 600px; margin: 3rem auto; padding: 0 1rem; }
+        label { display: block; margin-top: 1rem; }
+        input { width: 100%; padding: .5rem; box-sizing: border-box; }
+        button { margin-top: 1.5rem; padding: .6rem 2rem; }
+        .info { color: #555; font-size: .9rem; }
+        table { width: 100%; border-collapse: collapse; margin-top: 2rem; }
+        th, td { border: 1px solid #ccc; padding: .4rem .6rem; text-align: left; }
+        th { background: #eee; }
+        .empty { color: #888; margin-top: 1.5rem; }
+    </style>
+</head>
+<body>
+    <h2>Vitaj, {{ user_name }}!</h2>
+    <p class="info">
+        Súťažné kolo: {{ problem_set_start }} – {{ problem_set_end }}
+    </p>
+    <p class="info">
+        Pokus č. {{ attempt_count + 1 }} (relácia od {{ session_started_at }})
+    </p>
+
+    <form action="/submit" method="post">
+<label for="score">Počet bodov <span class="info">(0–{{ max_points }})</span></label>
+<input type="number" name="score" id="score" step="any" required>
+        <button type="submit">Odovzdať</button>
+    </form>
+
+    <h3>Moje odovzdania</h3>
+    {% if submits %}
+    <table>
+        <thead>
+            <tr><th>ID</th><th>Skóre</th><th>Dáta</th></tr>
+        </thead>
+        <tbody>
+            {% for s in submits %}
+            <tr><td>{{ s.id }}</td><td>{{ s.score }}</td><td>{{ s.external_data }}</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p class="empty">Zatiaľ žiadne odovzdania.</p>
+    {% endif %}
+</body>
+</html>
