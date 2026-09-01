@@ -1,49 +1,755 @@
 <!DOCTYPE html>
-<html lang="sk">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <title>Interaktívka — odovzdanie</title>
-    <style>
-        body { font-family: sans-serif; max-width: 600px; margin: 3rem auto; padding: 0 1rem; }
-        label { display: block; margin-top: 1rem; }
-        input { width: 100%; padding: .5rem; box-sizing: border-box; }
-        button { margin-top: 1.5rem; padding: .6rem 2rem; }
-        .info { color: #555; font-size: .9rem; }
-        table { width: 100%; border-collapse: collapse; margin-top: 2rem; }
-        th, td { border: 1px solid #ccc; padding: .4rem .6rem; text-align: left; }
-        th { background: #eee; }
-        .empty { color: #888; margin-top: 1.5rem; }
-    </style>
+<title>Prask &ndash; robot</title>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<style>
+html { color-scheme: light dark }
+body { font-family: sans-serif }
+canvas, textarea { max-width: 100% }
+.editing .runner, .running .editor { display: none }
+.next { background-color: #ff05 }
+.error { background-color: #f005 }
+@media(min-width: 800px) {
+	canvas { position: fixed; top: 8px; left: 8px }
+	.runner, .editor { margin-left: 508px }
+}
+</style>
 </head>
-<body>
-    <h2>Vitaj, {{ user_name }}!</h2>
-    <p class="info">
-        Súťažné kolo: {{ problem_set_start }} – {{ problem_set_end }}
-    </p>
-    <p class="info">
-        Pokus č. {{ attempt_count + 1 }} (relácia od {{ session_started_at }})
-    </p>
+<!-- body ma class "editing" alebo "running" podla toho,
+ci aktualne upravujeme alebo pustame program, a podla toho sa vdaka css
+automaticky ukazu/schovaju tie spravne elementy -->
+<body class="editing">
+<canvas id="canvas" width="500", height="500"></canvas>
+<div class="runner">
+	<div>
+		<button id="run" onclick="run()">Spustiť</button>
+		<button id="pause" disabled onclick="pause()">Zastaviť</button>
+		<button id="step" onclick="step()">Krok</button>
+		<button id="reset" onclick="reset()">Odznovu</button>
+		<button onclick="edit()">Upraviť program</button>
+	</div>
+	<div><label>
+		Rýchlosť robota:
+		<input type="range" min="3" max="100" value="3"
+		oninput="animDuration = 1000/this.value"/>
+	</label></div>
+	<p id="status">Všetko ok</p>
+	<pre id="program-view"># Sem napíš svoj program...</pre>
+</div>
+<div class="editor">
+	<div><button onclick="save()">Uložiť</button></div>
+	<textarea id="program-edit" cols="50" rows="30"># Sem napíš svoj program...
+</textarea>
+</div>
+<script>
+var gridSize = 9;
+/*	Kolko tehal je na ktorom mieste */
+var grid = Array(gridSize * gridSize);
+/*	Dir je cislo od 0 do 3, ktore udava smer: 0 je smerom ku kladnemu x-u,
+	a kazde dalsie je otocene o 90 stupnov dolava, teda 1 je smerom ku
+	kladnemu y-u.
+	Predosle pozicie su tam kvoli animaciam. animStart je cas, kedy zacala
+	animacia, alebo null, ak ziadna neprebieha. */
+var robotX, robotY, robotDir, robotPrevX, robotPrevY, robotPrevDir, animStart;
+/*	Preklad dir-cisel do suradnic */
+var dirX = [1, 0, -1, 0], dirY = [0, 1, 0, -1];
+/*	Ked sme pocas behu programu v nejakom cykle, pamatame si, na ktorej pozicii
+	zacina (jump), a kolko opakovani nam este ostava (count). Kedze moze byt viac
+	vnorenych cyklov, tak je to stack. */
+var repeatJumps = [], repeatCounts = [];
+/*	pendingStep: ak chceme spravit krok, ale este prebieha animacia, tak pockame,
+	kym animacia skonci, a az potom spravime dalsi krok.
+	running: 0 znamena ze program je zastaveny, 1 znamena ze bezi a 2 znamena
+	ze bezi ale chceme ho zastavit. Treba to preto, lebo pocas beziaceho programu
+	si na zaciatku kroku vypytame ze o nejaky timeout chceme spravit dalsi,
+	ale ak pocas bezania tohto kroku zastavime program, tak ten dalsi uz nebudeme
+	chciet spravit. */
+var pendingStep = false, running = 0;
+var animDuration = 1000/3;
 
-    <form action="/submit" method="post">
-<label for="score">Počet bodov <span class="info">(0–{{ max_points }})</span></label>
-<input type="number" name="score" id="score" step="any" required>
-        <button type="submit">Odovzdať</button>
-    </form>
+/*	Text programu */
+var source = localStorage.getItem("robot-source") || "";
+/*	Program sa kompiluje do ciselnych instrukcii, aby sa dal potom lahko pustat
+	a nemusel sa vzdy znovu parsovat. Parsovanie funguje tak, ze postupne citame
+	text programu (vstup) a piseme instrukcie aj html verziu, ktora je to iste
+	ako povodny text programu, ale klucove slova su boldom a riadky su zabalene
+	v divoch, ktorym sa da dat class, aby sa zvyraznil aktualny alebo chybovy
+	riadok. Pri citani sa ignoruje diakritika a velke/male pismena.
+	program: skompilovane instrukcie programu.
+	programCounter: ktora instrukcia ide byt spustena ako dalsia.
+	sourcePos: kde v sourci sa nachadzame pri parsovani.
+	sourceView: html verzia textu programu, ktora sa ukaze po ulozeni.
+	Je to zoznam stringov, kam sa pocas parsovania postupne pridava
+	a nakoniec sa joinnu.
+	sourceViewLine: nadchadzajuci riadok zo sourceView, ktory prave vyrabame.
+	Musime si ho pamatat zvlast, lebo kym ho napiseme, potrebujeme vediet
+	(1) ktora skompilovana instrukcia v nom je, a (2) ci v nom neni chyba.
+	instructionId: miesto v skompilovanom programe, ktore zodpoveda aktualnemu
+	sourceViewLine. */
+var program = [], programCounter, sourcePos, sourceView, sourceViewLine, instructionId;
+var FORWARD = 0, LEFT = 1, RIGHT = 2, LAY = 3, TAKE = 4, END = 5, REPEAT = 6;
+var diacritics = {"ľ": "l", "ž": "z", "Ľ": "l", "Ž": "z"};
 
-    <h3>Moje odovzdania</h3>
-    {% if submits %}
-    <table>
-        <thead>
-            <tr><th>ID</th><th>Skóre</th><th>Dáta</th></tr>
-        </thead>
-        <tbody>
-            {% for s in submits %}
-            <tr><td>{{ s.id }}</td><td>{{ s.score }}</td><td>{{ s.external_data }}</td></tr>
-            {% endfor %}
-        </tbody>
-    </table>
-    {% else %}
-    <p class="empty">Zatiaľ žiadne odovzdania.</p>
-    {% endif %}
+var canvas = document.getElementById("canvas");
+var cc = canvas.getContext("2d");
+canvas.style = "width: " + canvas.width + "px";
+canvas.width *= devicePixelRatio;
+canvas.height *= devicePixelRatio;
+
+var padding = 12 * devicePixelRatio;
+/*	Nech x, y, z su bazove vektory v 3d priestore, teda x je 1 krok doprava,
+	y jeden krok do dialky a z jeden krok hore. Tieto vektory sa linearne
+	premietnu na obrazovku: x na (projX, projY), co je doprava dole, y na
+	(-projX, projY), co je dolava dole, a z na (0, projZ), co je hore.
+	Je to zratane tak, aby obrys kocky na obrazovke bol pravidelny 6-uholnik. */
+var projX = (canvas.width / 2 - padding) / (gridSize * 7);
+var projY = projX / Math.sqrt(3);
+var projZ = projY * 2;
+/*	Toto nam hovori, kde na obrazovke je bod (0, 0, 0) v 3d priestore. */
+var originX = padding;
+var originY = canvas.height - padding - projY * gridSize * 7;
+var tox, toy, txx, txy, tyx, tyy;
+
+/*	Aby to posobilo viac 3d, pre obdlzniky co kreslime sa automaticky rata
+	osvetlenie. Sunlight reprezentuje vektor presne oproti slnecnemu svetlu,
+	takze intenzita svetla na ploche je skalarny sucin sunlightu a normaloveho
+	vektoru plochy. */
+var ambientLight = 0.7;
+var sunlightX = 0.3;
+var sunlightY = -0.1;
+var sunlightZ = 0.5;
+var currentLight;
+
+var colorR = 0, colorG = 0, colorB = 0;
+
+/*	Vypne sa pri robeni screenshotov (ukladani canvasu), aby ked tie obrazky
+	davame do zadania, tak aby na nich bola iba ta stavba, kedze je jedno
+	ako skonci robot. */
+var drawRobot = true;
+
+/*	Nastavi cc.fillStyle, aby zodpovedal aktualnej farbe a intenzite svetla. */
+function updateFillStyle() {
+	cc.fillStyle = "rgb(" +
+		Math.min(255, colorR * currentLight) + ", " +
+		Math.min(255, colorG * currentLight) + ", " +
+		Math.min(255, colorB * currentLight) + ")";
+}
+
+/*	Nastavi aktualnu farbu (pri defaultnom osvetleni) */
+function color(r, g, b) {
+	colorR = r; colorG = g; colorB = b; updateFillStyle();
+}
+
+/*	Nastavi aktualnu plochu, na ktoru kreslime, a spocita intenzitu svetla na nej.
+	Plocha je zadana jej pociatkom (bodom (0, 0) na nej) a 3d vektormi u, v,
+	ktore hovoria, ktorym smerom idu x a y suradnice na tej ploche. */
+function surface(x, y, z, ux, uy, uz, vx, vy, vz) {
+	/*	normalovy vektor plochy (vektorovy sucin u * v) */
+	var wx = uy * vz - uz * vy;
+	var wy = uz * vx - ux * vz;
+	var wz = ux * vy - uy * vx;
+	var wlength = Math.sqrt(wx * wx + wy * wy + wz * wz);
+	currentLight = ambientLight + Math.max(0,
+		wx * sunlightX + wy * sunlightY + wz * sunlightZ) / wlength;
+	updateFillStyle();
+	/*	kam sa premietne pociatok plochy a jej bazove vektory */
+	tox = originX + projX * (x + y);
+	toy = originY + projY * (x - y) - projZ * z;
+	txx = projX * (ux + uy);
+	txy = projY * (ux - uy) - projZ * uz;
+	tyx = projX * (vx + vy);
+	tyy = projY * (vx - vy) - projZ * vz;
+}
+
+function transformX(x, y) {
+	return tox + txx * x + tyx * y;
+}
+
+function transformY(x, y) {
+	return toy + txy * x + tyy * y;
+}
+
+/*	Nakresli na aktualnu plochu s aktualnou farbou obdlznik na suradnice x, y
+	s rozmermi w, h */
+function rect(x, y, w, h) {
+	cc.beginPath();
+	cc.moveTo(transformX(x, y), transformY(x, y));
+	cc.lineTo(transformX(x + w, y), transformY(x + w, y));
+	cc.lineTo(transformX(x + w, y + h), transformY(x + w, y + h));
+	cc.lineTo(transformX(x, y + h), transformY(x, y + h));
+	cc.closePath();
+	cc.fill();
+}
+
+/*	Nakresli tehlovu stenu v mriezke na pozicii (x, y), vysoku height tehal.
+	Ak tam ziadne tehly nie su, tak nakresli kamienky na zemi. */
+function wall(x, y, height) {
+	surface(7 * x, 7 * y, 6 * height, 1, 0, 0, 0, 1, 0);
+	if (height === 0) {
+		color(171, 159, 91);
+		rect(2, 4, 1, 1);
+		rect(3, 2, 1, 1);
+		rect(4, 3, 1, 1);
+	}
+	else {
+		color(199, 86, 30);
+		rect(0, 0, 7, 7);
+		color(163, 67, 20);
+		for (var i = 0; i < 3; i++) {
+			for (var j = 0; j < 3; j++)
+				rect(1 + 2 * i, 1 + 2 * j, 1, 1);
+		}
+		surface(7 * x, 7 * y, 0, 1, 0, 0, 0, 0, 1);
+		color(199, 86, 30);
+		rect(0, 0, 7, 6 * height);
+		color(163, 67, 20);
+		for (var i = 0; i < height; i++) {
+			rect(1, 1 + i * 6, 1, 4);
+			rect(3, 1 + i * 6, 1, 4);
+			rect(5, 1 + i * 6, 1, 4);
+		}
+		color(199, 86, 30);
+		surface(7 * x + 7, 7 * y, 0, 0, 1, 0, 0, 0, 1);
+		rect(0, 0, 7, 6 * height);
+		color(163, 67, 20);
+		for (var i = 0; i < height; i++) {
+			rect(1, 1 + i * 6, 1, 4);
+			rect(3, 1 + i * 6, 1, 4);
+			rect(5, 1 + i * 6, 1, 4);
+		}
+	}
+}
+
+function easeOut(t) {
+	return 1 - Math.pow(1 - t, 3);
+}
+
+function flower(x, y) {
+	color(235, 232, 221);
+	rect(x + 1, y, 1, 3);
+	rect(x, y + 1, 3, 1);
+	color(219, 179, 22);
+	rect(x + 1, y + 1, 1, 1);
+}
+
+/*	Nakresli kvetinky a ine farebne dekoracie do velkeho stvorca na pozicii
+	(x, y). Velky stvorec so suradnicami (0, 0) je hracia plocha a susedne
+	suradnice zodpovedaju stvorcu vedla neho v tom smere. */
+function flowers(x, y) {
+	var baseX = x * gridSize * 7;
+	var baseY = y * gridSize * 7;
+	flower(baseX + 34, baseY + 49);
+	flower(baseX + 8, baseY + 34);
+	flower(baseX + 12, baseY + 53);
+	flower(baseX + 14, baseY + 18);
+	flower(baseX + 44, baseY + 22);
+	flower(baseX + 44, baseY + 22);
+	color(102, 156, 12);
+	rect(baseX + 56, baseY + 27, 1, 1);
+	rect(baseX + 53, baseY + 13, 1, 1);
+	rect(baseX + 9, baseY + 18, 1, 1);
+	rect(baseX + 41, baseY + 12, 1, 1);
+	rect(baseX + 3, baseY + 50, 1, 1);
+	rect(baseX + 44, baseY + 50, 1, 1);
+	rect(baseX + 46, baseY + 49, 1, 1);
+	rect(baseX + 13, baseY + 29, 1, 1);
+	rect(baseX + 53, baseY + 45, 1, 1);
+	rect(baseX + 38, baseY + 58, 1, 1);
+	rect(baseX + 43, baseY + 30, 1, 1);
+	rect(baseX + 38, baseY + 8, 1, 1);
+	rect(baseX + 8, baseY + 15, 1, 1);
+	rect(baseX + 19, baseY + 3, 1, 1);
+}
+
+/*	Nakresli celu scenu */
+function scene() {
+	/*	Kreslenie funguje tak, ze mame svet rozdeleny na gridove policka, a kazde z nich je mriezka
+		7x7, do ktorej sa kreslia obrazky.
+		Trava, podlozka a kvetinky */
+	surface(0, 0, 0, 1, 0, 0, 0, 1, 0);
+	color(119, 173, 31);
+	cc.fillRect(0, 0, canvas.width, canvas.height);
+	flowers(-1, 0);
+	flowers(0, -1);
+	flowers(-1, 1);
+	flowers(-1, 0);
+	flowers(0, 1);
+	flowers(1, 0);
+	color(217, 201, 115);
+	rect(0, 0, 7 * gridSize, 7 * gridSize);
+
+	/*	Musime veci kreslit v spravnom poradi podla toho co je pred cim, takze ideme po lajnach,
+		co su policka s rovnakym rozdielom x - y (na obrazovke vodorovne ciary). Vacsinou to staci,
+		problem je, ze ked robot prechadza z jednej lajny do druhej, tak sa moze stat, ze na zaciatku
+		kroku ma byt pred tou prednou z tych lajn, ale na konci kroku az za nou (alebo opacne).
+		Fixuje sa to tak, ze ak sa robot hyba cez dve lajny, tak sa defaultne kreslia obe,
+		ale z tej prednej lajny sa tehly ktore su vyssie ako robot nakreslia az po nom. */
+	var robotLine = Math.max(robotX - robotY, robotPrevX - robotPrevY);
+	var robotHeight = grid[gridSize * robotY + robotX];
+
+	/*	Ak prebieha animacia, zinterpolujeme polohu a smer robota. */
+	var animX = robotX, animY = robotY, animDir = robotDir, animHeight = robotHeight;
+	if (animStart !== null) {
+		var t = (Date.now() - animStart) / animDuration;
+		if (t >= 1) {
+			/*	Ak animacia uz konci, tak ju vypneme */
+			animStart = null;
+			/*	Po konci animacie byva t typicky >1, lebo frame sa nakresli az nejaky cas potom
+				ako animacia skonci. Takze neinterpolujeme ale zoberieme uz nove hodnoty. */
+			robotPrevX = robotX;
+			robotPrevY = robotY;
+			robotPrevDir = robotDir;
+			if (pendingStep) {
+				pendingStep = false;
+				step();
+			}
+		}
+		else {
+			requestAnimationFrame(scene);
+			if (robotDir !== robotPrevDir) {
+				/*	Musime specialne osetrit tie zmeny smeru ktore idu z 3 zase na 0 a naopak. */
+				if (robotDir === 0 && robotPrevDir === 3)
+					animDir = 3 + easeOut(t);
+				else if (robotDir === 3 && robotPrevDir === 0)
+					animDir = 4 - easeOut(t);
+				else animDir = robotPrevDir + easeOut(t) * (robotDir - robotPrevDir);
+			}
+			else {
+				var robotPrevHeight = grid[gridSize * robotPrevY + robotPrevX];
+				/*	Ak sme na rovine, ideme rovno, inak skaceme po parabole. Parabola je
+					magicky zvolena aby sa robot akurat neprekryval ("nenarazil") so susednou
+					tehlou, na ktoru/z ktorej skace. */
+				if (robotPrevHeight === robotHeight) {
+					animX = robotPrevX + easeOut(t) * (robotX - robotPrevX);
+					animY = robotPrevY + easeOut(t) * (robotY - robotPrevY);
+				}
+				else {
+					if (robotPrevHeight < robotHeight)
+						animHeight = robotPrevHeight - 7 * t * (t - 8/7);
+					else animHeight = robotHeight + 7 * (1 - t) * (t + 1/7);
+					animX = robotPrevX + t * (robotX - robotPrevX);
+					animY = robotPrevY + t * (robotY - robotPrevY);
+				}
+			}
+		}
+	}
+
+	for (var line = -gridSize + 1; line < gridSize; line++) {
+		for (var x = Math.max(0, line); x < gridSize && x < gridSize + line; x++) {
+			var y = x - line;
+			var height = grid[y * gridSize + x];
+
+			/* pozri definiciu robotLine */
+			if (line !== robotLine || height <= animHeight) wall(x, y, height);
+
+			/* Robot */
+			if (drawRobot && Math.max(robotX, robotPrevX) === x && Math.min(robotY, robotPrevY) === y) {
+				/*	Aby sme nemuseli riesit, ktore steny robota su vpredu a vzadu,
+					tak vzdy kreslime tie dve ktore su aktualne viditelne, ako tu "vlavo"
+					a "vpravo". Pri tom nas zaujima otocenie len modulo 90 stupnov,
+					lebo inak je ten stvorec symetricky. */
+				var wrappedDir = (animDir + 0.5) % 1 - 0.5;
+				/*	Aby sme ale vedeli, kde chceme nakreslit oci a zadnu cast hlavy,
+					potrebujeme vediet aj, o kolko celych pravych uhlov je robot otoceny. */
+				var phase = animDir - wrappedDir;
+				var sin = Math.sin(wrappedDir * Math.PI / 2);
+				var cos = Math.cos(wrappedDir * Math.PI / 2);
+				surface(
+					7 * animX + 3.5 - 2.5 * (cos - sin),
+					7 * animY + 3.5 - 2.5 * (sin + cos),
+					6 * animHeight, cos, sin, 0, 0, 0, 1
+				);
+				color(196, 196, 196);
+				rect(0, 0, 5, 6);
+				color(235, 232, 221);
+				rect(0, 6, 5, 4);
+				/*	Oci a zadna cast hlavy. Porovnavame len priblizne, lebo floaty su nepresne */
+				if (Math.abs(phase - 3) < 0.001) {
+					color(38, 38, 37);
+					rect(1, 8, 1, 1);
+					rect(3, 8, 1, 1);
+				}
+				else if (Math.abs(phase - 1) < 0.001) {
+					color(209, 206, 194);
+					rect(1, 8, 3, 1);
+				}
+				surface(
+					7 * animX + 3.5 + 2.5 * (cos + sin),
+					7 * animY + 3.5 + 2.5 * (sin - cos),
+					6 * animHeight, -sin, cos, 0, 0, 0, 1
+				);
+				color(196, 196, 196);
+				rect(0, 0, 5, 6);
+				color(235, 232, 221);
+				rect(0, 6, 5, 4);
+				if (Math.abs(phase) < 0.001 || Math.abs(phase - 4) < 0.001) {
+					color(38, 38, 37);
+					rect(1, 8, 1, 1);
+					rect(3, 8, 1, 1);
+				}
+				else if (Math.abs(phase - 2) < 0.001) {
+					color(209, 206, 194);
+					rect(1, 8, 3, 1);
+				}
+				surface(
+					7 * animX + 3.5 - 2.5 * (cos - sin),
+					7 * animY + 3.5 - 2.5 * (sin + cos),
+					6 * animHeight + 10, cos, sin, 0, -sin, cos, 0
+				);
+				/* Antenka */
+				color(235, 232, 221);
+				rect(0, 0, 5, 5);
+				surface(
+					7 * animX + 3.5 - 0.5 * (cos - sin),
+					7 * animY + 3.5 - 0.5 * (sin + cos),
+					6 * animHeight + 10, cos, sin, 0, 0, 0, 1
+				);
+				rect(0, 0, 1, 2);
+				color(212, 36, 42);
+				rect(0, 2, 1, 1);
+				surface(
+					7 * animX + 3.5 + 0.5 * (cos + sin),
+					7 * animY + 3.5 + 0.5 * (sin - cos),
+					6 * animHeight + 10, -sin, cos, 0, 0, 0, 1
+				);
+				color(235, 232, 221);
+				rect(0, 0, 1, 2);
+				color(212, 36, 42);
+				rect(0, 2, 1, 1);
+				surface(
+					7 * animX + 3.5 - 0.5 * (cos - sin),
+					7 * animY + 3.5 - 0.5 * (sin + cos),
+					6 * animHeight + 13, cos, sin, 0, -sin, cos, 0
+				);
+				rect(0, 0, 1, 1);
+			}
+		}
+		if (robotLine === line) {
+			for (var x = Math.max(0, line); x < gridSize && x < gridSize + line; x++) {
+				var y = x - line;
+				var height = grid[y * gridSize + x];
+				if (height > animHeight) wall(x, y, height);
+			}
+		}
+	}
+}
+
+/*	Vrati program na zaciatok, zastavi ho a podla toho updatene tlacitka a zmaze,
+	co je aktualne postavene. */
+function reset() {
+	for (var i = 0; i < grid.length; i++) grid[i] = 0;
+	robotX = 4, robotY = 4, robotDir = 0;
+	robotPrevX = robotX, robotPrevY = robotY, robotPrevDir = robotDir;
+	animStart = null;
+	document.getElementById("run").disabled = false;
+	document.getElementById("step").disabled = false;
+	document.getElementById("pause").disabled = true;
+	document.getElementById("status").innerHTML = "Všetko ok";
+	running = (running === 1) ? 2 : 0;
+	setProgramCounter(0);
+	repeatJumps = [];
+	repeatCounts = [];
+	scene();
+}
+
+/*	Nastavi programCounter a podla toho zvyrazni aktualny riadok v kode.
+	Ak prideme na koniec, tak podla toho updatene status a tlacitka. */
+function setProgramCounter(i) {
+	if (programCounter < program.length) {
+		document.getElementById("i" + programCounter).className = "";
+	}
+	programCounter = i;
+	if (i < program.length) {
+		document.getElementById("i" + programCounter).className = "next";
+	}
+	else {
+		document.getElementById("run").disabled = true;
+		document.getElementById("step").disabled = true;
+		document.getElementById("pause").disabled = true;
+		document.getElementById("status").innerHTML = "Koniec programu";
+		running = 2;
+	}
+}
+
+/*	Napise instrukciu do skompilovaneho programu a podla toho updatene cislo
+	instrukcie pre aktualny riadok. */
+function writeInstruction(instruction) {
+	instructionId = program.length;
+	program.push(instruction);
+}
+
+/*	Novy riadok sa nerata ako whitespace, lebo ma v kode vyznam, ale ostatny
+	whitespace mozeme ignorovat. */
+function isWhitespace(char) {
+	return char === " " || char === "\t" || char === "\r";
+}
+
+/*	Kym je na vstupe whitespace, tak ho odtial precita */
+function readWhitespace() {
+	while (sourcePos < source.length && isWhitespace(source[sourcePos]))
+		sourceViewLine.push(source[sourcePos++]);
+}
+
+/*	Ak je na vstupe koniec riadku, tak ho precita, a aj vsetok whitespace
+	a prazdne riadky po nom. Vrati, ci na vstupe bol koniec riadku. */
+function readEndOfLine() {
+	if (sourcePos < source.length && source[sourcePos] !== "\n") return false;
+	while (source[sourcePos] === "\n" || sourcePos === source.length) {
+		sourcePos++;
+		sourceView.push("<div");
+		if (instructionId !== null) {
+			sourceView.push(' id="i');
+			sourceView.push(instructionId);
+			sourceView.push('"');
+		}
+		sourceView.push(">");
+		sourceView.push(sourceViewLine.join(""));
+		if (sourceViewLine.length === 0) sourceView.push(" ");
+		sourceView.push("</div>");
+		sourceViewLine = [];
+		instructionId = null;
+		readWhitespace();
+		if (sourcePos >= source.length) break;
+	}
+	return true;
+}
+
+/*	Precita aktualny riadok az do konca. */
+function readLine() {
+	while (!readEndOfLine()) sourceViewLine.push(source[sourcePos++]);
+}
+
+/*	Da zo znaku prec diakritiku a velke pismena zmeni na male. Je safe
+	aj pre undefined, lebo obcas skusame citat znaky az za koncom sourcu. */
+function normalize(char) {
+	if (!char) return char;
+	var lower = char.toLowerCase();
+	if (char in diacritics) return diacritics[lower];
+	return lower;
+}
+
+/*	Ak je na vstupe slovo word, tak ho precita a da ho do sourceView zvyraznene.
+	Za slovom musi byt koniec vstupu alebo nejake nie-pismeno. */
+function readWord(word) {
+	for (var i = 0; i < word.length; i++) {
+		if (normalize(source[sourcePos + i]) !== word[i]) return false;
+	}
+	var next = normalize(source[sourcePos + word.length])
+	if (next && 97 <= next.charCodeAt(0) && next.charCodeAt(0) <= 122) return false;
+	sourceViewLine.push("<b>");
+	sourceViewLine.push(source.substring(sourcePos, sourcePos + word.length));
+	sourceViewLine.push("</b>");
+	sourcePos += word.length;
+	readWhitespace();
+	return true;
+}
+
+/*	Ak je na vstupe cislo, precita a vrati ho, inak vrati null. */
+function readNumber() {
+	if (sourcePos >= source.length) return null;
+	var first = source[sourcePos].charCodeAt(0);
+	if (first < 48 || first >= 58) return null;
+	sourceViewLine.push(source[sourcePos++]);
+	var value = first - 48;
+	while (sourcePos < source.length) {
+		var digit = source[sourcePos].charCodeAt(0);
+		if (digit < 48 || digit >= 58) break;
+		value = 10 * value + digit - 48;
+		sourceViewLine.push(source[sourcePos++]);
+	}
+	return value;
+}
+
+/*	Hodi zvysok aktualneho riadku do sourceView a pod neho napise chybu.
+	Ma sa to pouzivat tak, ze returne z funkcie co parsuje, lebo ked mame
+	chybu pri kompilacii, uz nechceme pokracovat dalej. */
+function compileError(message) {
+	readLine();
+	sourceView.push('<div class="error"><b>Chyba:</b> ');
+	sourceView.push(message);
+	sourceView.push("</div>");
+	document.getElementById("program-view").innerHTML = sourceView.join("");
+	document.getElementById("reset").disabled = true;
+	document.getElementById("step").disabled = true;
+	document.getElementById("run").disabled = true;
+	document.body.className = "running";
+}
+
+/*	Ulozi program z editora a sparsuje ho. */
+function save() {
+	source = document.getElementById("program-edit").value;
+	localStorage.setItem("robot-source", source);
+	sourcePos = 0;
+	sourceView = [];
+	sourceViewLine = [];
+	instructionId = null;
+	program = [];
+	openCycleCount = 0;
+	readWhitespace();
+	readEndOfLine();
+	while (sourcePos < source.length) {
+		if (source[sourcePos] === "#") {
+			readLine();
+			continue;
+		}
+		if (readWord("krok")) writeInstruction(FORWARD);
+		else if (readWord("dolava")) writeInstruction(LEFT);
+		else if (readWord("doprava")) writeInstruction(RIGHT);
+		else if (readWord("poloz")) writeInstruction(LAY);
+		else if (readWord("zober")) writeInstruction(TAKE);
+		else if (readWord("opakuj")) {
+			var n = readNumber();
+			if (n === null) return compileError("po 'opakuj' musí nasledovať číslo: počet opakovaní");
+			/*	opakovanie su vsetky instrukcie s cislom >= REPEAT, a v instrukcii je schovany
+				aj pocet opakovani. */
+			writeInstruction(REPEAT + n);
+			openCycleCount++;
+		}
+		else if (readWord("koniec")) {
+			if (openCycleCount-- === 0) return compileError("nie je žiadne otvorené opakovanie");
+			writeInstruction(END);
+		}
+		else return compileError("neznámy príkaz");
+		if (!readEndOfLine()) return compileError("po príkaze musí nasledovať nový riadok");
+	}
+	if (openCycleCount > 0) return compileError("neukončené opakovanie");
+	document.getElementById("program-view").innerHTML = sourceView.join("");
+	document.body.className = "running";
+	document.getElementById("reset").disabled = false;
+	reset();
+}
+
+function edit() {
+	document.body.className = "editing";
+	pause();
+}
+
+function runtimeError(message) {
+	running = false;
+	document.getElementById("step").disabled = true;
+	document.getElementById("pause").disabled = true;
+	document.getElementById("run").disabled = true;
+	document.getElementById("i" + programCounter).className = "error";
+	document.getElementById("status").innerHTML = "<b>Chyba:</b> " + message;
+}
+
+function step() {
+	if (running === 2) {
+		running = 0;
+		return;
+	}
+	if (animStart !== null) {
+		pendingStep = true;
+		return;
+	}
+	if (running === 1) setTimeout(step, animDuration);
+	var instruction = program[programCounter];
+	var frontX = robotX + dirX[robotDir], frontY = robotY + dirY[robotDir];
+	switch (instruction) {
+		case FORWARD:
+			if (
+				frontX < 0 || frontX >= gridSize ||
+				frontY < 0 || frontY >= gridSize
+			) return runtimeError("nemôžem sa pohnúť von z poľa");
+			var robotHeight = grid[gridSize * robotY + robotX];
+			var frontHeight = grid[gridSize * frontY + frontX];
+			if (frontHeight - robotHeight > 1)
+				return runtimeError("nemôžem vyskočiť tak vysoko");
+			if (frontHeight - robotHeight < -1)
+				return runtimeError("nemôžem zoskočiť tak nízko");
+			robotX = frontX;
+			robotY = frontY;
+			animStart = Date.now();
+		break;
+		case LEFT:
+			robotDir = (robotDir + 1) % 4;
+			animStart = Date.now();
+		break;
+		case RIGHT:
+			robotDir = (robotDir + 3) % 4;
+			animStart = Date.now();
+		break;
+		case LAY:
+			if (
+				frontX < 0 || frontX >= gridSize ||
+				frontY < 0 || frontY >= gridSize
+			) return runtimeError("nemôžem položiť tehlu von z poľa");
+			var robotHeight = grid[gridSize * robotY + robotX];
+			var frontHeight = grid[gridSize * frontY + frontX];
+			if (frontHeight - robotHeight > 1)
+				return runtimeError("nemôžem položiť tehlu tak ďaleko nad seba");
+			if (frontHeight - robotHeight < -1)
+				return runtimeError("nemôžem položiť tehlu tak ďaleko pod seba");
+			grid[gridSize * frontY + frontX] += 1;
+		break;
+		case TAKE:
+			if (
+				frontX < 0 || frontX >= gridSize ||
+				frontY < 0 || frontY >= gridSize
+			) return runtimeError("nemám pred sebou žiadnu tehlu");
+			var robotHeight = grid[gridSize * robotY + robotX];
+			var frontHeight = grid[gridSize * frontY + frontX];
+			if (frontHeight - robotHeight > 2)
+				return runtimeError("nemôžem zobrať tehlu tak zďaleka nad sebou");
+			if (frontHeight - robotHeight < 0)
+				return runtimeError("nemôžem zobrať tehlu tak zďaleka pod sebou");
+			if (frontHeight === 0)
+				return runtimeError("nemám pred sebou žiadnu tehlu");
+			grid[gridSize * frontY + frontX] -= 1;
+		break;
+		case END:
+			repeatCounts[repeatCounts.length - 1] -= 1;
+			if (repeatCounts[repeatCounts.length - 1] === 0) {
+				repeatCounts.pop();
+				repeatJumps.pop();
+			}
+			else setProgramCounter(repeatJumps[repeatJumps.length - 1]);
+		break;
+		default:
+			repeatJumps.push(programCounter);
+			repeatCounts.push(instruction - REPEAT);
+		break;
+	}
+	setProgramCounter(programCounter + 1);
+	scene();
+}
+
+function run() {
+	running = 1;
+	document.getElementById("pause").disabled = false;
+	document.getElementById("run").disabled = true;
+	document.getElementById("step").disabled = true;
+	step();
+}
+
+function pause() {
+	running = 2;
+	document.getElementById("pause").disabled = true;
+	document.getElementById("run").disabled = false;
+	document.getElementById("step").disabled = false;
+}
+
+function screenshot() {
+	drawRobot = false;
+	scene();
+	canvas.toBlob(function(blob) {
+		var link = document.createElement("a");
+		link.download = "uloha";
+		var url = URL.createObjectURL(blob);
+		link.href = url;
+		link.click();
+		URL.revokeObjectURL(url);
+	})
+	drawRobot = true;
+}
+
+reset();
+if (source) {
+	document.getElementById("program-edit").value = source;
+	save();
+}
+</script>
 </body>
 </html>
